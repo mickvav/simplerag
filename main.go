@@ -16,12 +16,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var dbConn = ""
+
 const (
-	dbConn     = "postgres://user:password@localhost/dbname?sslmode=disable"
 	openaiKey  = "YOUR_OPENAI_API_KEY"
 	modelEmbed = "text-embedding-ada-002"
 	modelChat  = "gpt-4-turbo"
 )
+
+type LocalEmbeddingResponse struct {
+	Index int32 `json:"index"`
+	Embedding [][]float32 `json:"embedding"`
+}
+
 
 func generateEmbedding(text string) ([]float32, error) {
 	client := openai.NewClient(
@@ -40,8 +47,14 @@ func generateEmbedding(text string) ([]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-	print(resp.JSON.Data.Raw())
-	return []float32{}, nil
+	print("Embedding (raw):")
+	print(resp.RawJSON())
+	responses := []LocalEmbeddingResponse{}
+	err = json.Unmarshal([]byte(resp.RawJSON()), &responses)
+	if err != nil {
+		return nil, err
+	}
+	return responses[0].Embedding[0], nil
 }
 
 func storeEmbedding(db *sql.DB, content string, embedding []float32) error {
@@ -101,7 +114,7 @@ func generateLLMResponse(prompt string) (string, error) {
 				OfSystem: &openai.ChatCompletionSystemMessageParam{
 					Content: openai.ChatCompletionSystemMessageParamContentUnion{
 						OfString: param.Opt[string]{
-							Value:"Use the provided context to answer the user's query.",
+							Value: "Use the provided context to answer the user's query.",
 						},
 					},
 				},
@@ -130,6 +143,16 @@ func main() {
 
 	var rootCmd = &cobra.Command{Use: "helper"}
 
+	if os.ExpandEnv("$PG_PASSWORD_FILE") != "" {
+		password, err := os.ReadFile(os.ExpandEnv("$PG_PASSWORD_FILE"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		password = []byte(strings.TrimSpace(string(password)))
+		dbConn = fmt.Sprintf("postgres://postgres:%s@localhost:5432/postgres?sslmode=disable", string(password))
+	} else {
+		dbConn = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+	}
 	var addCmd = &cobra.Command{
 		Use:   "add -f <file_path>",
 		Short: "Add a document to the index",
@@ -231,8 +254,35 @@ func main() {
 	findCmd.Flags().IntVarP(&numResults, "num", "n", 3, "Number of results to return")
 	rootCmd.AddCommand(findCmd)
 
+	initdbCmd := &cobra.Command{
+		Use:   "initdb",
+		Short: "Initialize the database",
+		Run: func(cmd *cobra.Command, args []string) {
+			db, err := sql.Open("postgres", dbConn)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer db.Close()
+
+			_, err = db.Exec(`
+				CREATE EXTENSION IF NOT EXISTS vector;
+				CREATE TABLE IF NOT EXISTS documents (
+					id SERIAL PRIMARY KEY,
+					content TEXT,
+					embedding vector(1536)
+				);
+			`)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			fmt.Println("Database initialized successfully.")
+		},
+	}
+	rootCmd.AddCommand(initdbCmd)
+
 	var helpCmd = &cobra.Command{
-		Use:   "help <query>",
+		Use:   "query <query>",
 		Short: "Run LLM with relevant documents as context",
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) == 0 {
